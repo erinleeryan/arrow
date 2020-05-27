@@ -29,12 +29,15 @@ use arrow::array::{
     Int16BufferBuilder, StructArray,
 };
 use arrow::buffer::{Buffer, MutableBuffer};
-use arrow::datatypes::{DataType as ArrowType, Field, IntervalUnit};
+use arrow::datatypes::{DataType as ArrowType, Field, IntervalUnit, TimeUnit};
 
 use crate::arrow::converter::{
-    BinaryConverter, BoolConverter, Converter, Float32Converter, Float64Converter,
-    Int16Converter, Int32Converter, Int64Converter, Int8Converter, Int96Converter,
-    UInt16Converter, UInt32Converter, UInt64Converter, UInt8Converter, Utf8Converter,
+    BinaryArrayConverter, BinaryConverter, BoolConverter, BooleanArrayConverter,
+    Converter, FixedLenBinaryConverter, FixedSizeArrayConverter, Float32Converter,
+    Float64Converter, Int16Converter, Int32Converter, Int64Converter, Int8Converter,
+    Int96ArrayConverter, Int96Converter, TimestampMicrosecondConverter,
+    TimestampMillisecondConverter, UInt16Converter, UInt32Converter, UInt64Converter,
+    UInt8Converter, Utf8ArrayConverter, Utf8Converter,
 };
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
@@ -42,8 +45,8 @@ use crate::basic::{LogicalType, Repetition, Type as PhysicalType};
 use crate::column::page::PageIterator;
 use crate::column::reader::ColumnReaderImpl;
 use crate::data_type::{
-    BoolType, ByteArrayType, DataType, DoubleType, FloatType, Int32Type, Int64Type,
-    Int96Type,
+    BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType,
+    Int32Type, Int64Type, Int96Type,
 };
 use crate::errors::{ParquetError, ParquetError::ArrowError, Result};
 use crate::file::reader::{FilePageIterator, FileReader};
@@ -97,11 +100,12 @@ impl<T: DataType> PrimitiveArrayReader<T> {
             .clone();
 
         let mut record_reader = RecordReader::<T>::new(column_desc.clone());
-        record_reader.set_page_reader(
-            pages
-                .next()
-                .ok_or_else(|| general_err!("Can't build array without pages!"))??,
-        )?;
+        match pages.next() {
+            Some(page_reader) => {
+                record_reader.set_page_reader(page_reader?)?;
+            }
+            None => {}
+        }
 
         Ok(Self {
             data_type,
@@ -133,6 +137,9 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
             let records_to_read = batch_size - records_read;
 
             let records_read_once = self.record_reader.read_records(records_to_read)?;
+            if records_read_once == 0 {
+                break; // record reader has no record
+            }
             records_read = records_read + records_read_once;
 
             // Record reader exhausted
@@ -148,70 +155,74 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
         }
 
         // convert to arrays
-        let array = match (&self.data_type, T::get_physical_type()) {
-            (ArrowType::Boolean, PhysicalType::BOOLEAN) => {
-                BoolConverter::convert(self.record_reader.cast::<BoolType>())
-            }
-            (ArrowType::Int8, PhysicalType::INT32) => {
-                Int8Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Int16, PhysicalType::INT32) => {
-                Int16Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Int32, PhysicalType::INT32) => {
-                Int32Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::UInt8, PhysicalType::INT32) => {
-                UInt8Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::UInt16, PhysicalType::INT32) => {
-                UInt16Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::UInt32, PhysicalType::INT32) => {
-                UInt32Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Int64, PhysicalType::INT64) => {
-                Int64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::UInt64, PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::Float32, PhysicalType::FLOAT) => {
-                Float32Converter::convert(self.record_reader.cast::<FloatType>())
-            }
-            (ArrowType::Float64, PhysicalType::DOUBLE) => {
-                Float64Converter::convert(self.record_reader.cast::<DoubleType>())
-            }
-            (ArrowType::Timestamp(_, _), PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::Date32(_), PhysicalType::INT32) => {
-                UInt32Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Date64(_), PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::Time32(_), PhysicalType::INT32) => {
-                UInt32Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Time64(_), PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::Interval(IntervalUnit::YearMonth), PhysicalType::INT32) => {
-                UInt32Converter::convert(self.record_reader.cast::<Int32Type>())
-            }
-            (ArrowType::Interval(IntervalUnit::DayTime), PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (ArrowType::Duration(_), PhysicalType::INT64) => {
-                UInt64Converter::convert(self.record_reader.cast::<Int64Type>())
-            }
-            (arrow_type, physical_type) => Err(general_err!(
-                "Reading {:?} type from parquet {:?} is not supported yet.",
-                arrow_type,
-                physical_type
-            )),
-        }?;
+        let array =
+            match (&self.data_type, T::get_physical_type()) {
+                (ArrowType::Boolean, PhysicalType::BOOLEAN) => {
+                    BoolConverter::new(BooleanArrayConverter {})
+                        .convert(self.record_reader.cast::<BoolType>())
+                }
+                (ArrowType::Int8, PhysicalType::INT32) => {
+                    Int8Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Int16, PhysicalType::INT32) => {
+                    Int16Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Int32, PhysicalType::INT32) => {
+                    Int32Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::UInt8, PhysicalType::INT32) => {
+                    UInt8Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::UInt16, PhysicalType::INT32) => {
+                    UInt16Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::UInt32, PhysicalType::INT32) => {
+                    UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Int64, PhysicalType::INT64) => {
+                    Int64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (ArrowType::UInt64, PhysicalType::INT64) => {
+                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (ArrowType::Float32, PhysicalType::FLOAT) => Float32Converter::new()
+                    .convert(self.record_reader.cast::<FloatType>()),
+                (ArrowType::Float64, PhysicalType::DOUBLE) => Float64Converter::new()
+                    .convert(self.record_reader.cast::<DoubleType>()),
+                (ArrowType::Timestamp(unit, _), PhysicalType::INT64) => match unit {
+                    TimeUnit::Millisecond => TimestampMillisecondConverter::new()
+                        .convert(self.record_reader.cast::<Int64Type>()),
+                    TimeUnit::Microsecond => TimestampMicrosecondConverter::new()
+                        .convert(self.record_reader.cast::<Int64Type>()),
+                    _ => Err(general_err!("No conversion from parquet type to arrow type for timestamp with unit {:?}", unit)),
+                },
+                (ArrowType::Date32(_), PhysicalType::INT32) => {
+                    UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Date64(_), PhysicalType::INT64) => {
+                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (ArrowType::Time32(_), PhysicalType::INT32) => {
+                    UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Time64(_), PhysicalType::INT64) => {
+                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (ArrowType::Interval(IntervalUnit::YearMonth), PhysicalType::INT32) => {
+                    UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
+                }
+                (ArrowType::Interval(IntervalUnit::DayTime), PhysicalType::INT64) => {
+                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (ArrowType::Duration(_), PhysicalType::INT64) => {
+                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                }
+                (arrow_type, physical_type) => Err(general_err!(
+                    "Reading {:?} type from parquet {:?} is not supported yet.",
+                    arrow_type,
+                    physical_type
+                )),
+            }?;
 
         // save definition and repetition buffers
         self.def_levels_buffer = self.record_reader.consume_def_levels()?;
@@ -246,6 +257,7 @@ where
     rep_levels_buffer: Option<Vec<i16>>,
     column_desc: ColumnDescPtr,
     column_reader: Option<ColumnReaderImpl<T>>,
+    converter: C,
     _parquet_type_marker: PhantomData<T>,
     _converter_marker: PhantomData<C>,
 }
@@ -363,7 +375,7 @@ where
             data_buffer.into_iter().map(|t| Some(t)).collect()
         };
 
-        C::convert(data)
+        self.converter.convert(data)
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
@@ -380,7 +392,11 @@ where
     T: DataType,
     C: Converter<Vec<Option<T::T>>, ArrayRef> + 'static,
 {
-    fn new(pages: Box<dyn PageIterator>, column_desc: ColumnDescPtr) -> Result<Self> {
+    fn new(
+        pages: Box<dyn PageIterator>,
+        column_desc: ColumnDescPtr,
+        converter: C,
+    ) -> Result<Self> {
         let data_type = parquet_to_arrow_field(column_desc.as_ref())?
             .data_type()
             .clone();
@@ -392,6 +408,7 @@ where
             rep_levels_buffer: None,
             column_desc,
             column_reader: None,
+            converter,
             _parquet_type_marker: PhantomData,
             _converter_marker: PhantomData,
         })
@@ -592,21 +609,27 @@ where
 {
     let mut leaves = HashMap::<*const Type, usize>::new();
 
+    let mut filtered_fields: Vec<Rc<Type>> = Vec::new();
+
     for c in column_indices {
         let column = parquet_schema.column(c).self_type() as *const Type;
         leaves.insert(column, c);
+
+        let root = parquet_schema.get_column_root_ptr(c);
+        filtered_fields.push(root);
     }
 
     if leaves.is_empty() {
         return Err(general_err!("Can't build array reader without columns!"));
     }
 
-    ArrayReaderBuilder::new(
-        Rc::new(parquet_schema.root_schema().clone()),
-        Rc::new(leaves),
-        file_reader,
-    )
-    .build_array_reader()
+    let proj = Type::GroupType {
+        basic_info: parquet_schema.root_schema().get_basic_info().clone(),
+        fields: filtered_fields,
+    };
+
+    ArrayReaderBuilder::new(Rc::new(proj), Rc::new(leaves), file_reader)
+        .build_array_reader()
 }
 
 /// Used to build array reader.
@@ -804,10 +827,13 @@ impl<'a> ArrayReaderBuilder {
                 column_desc,
             )?)),
             PhysicalType::INT96 => {
+                let converter = Int96Converter::new(Int96ArrayConverter {});
                 Ok(Box::new(ComplexObjectArrayReader::<
                     Int96Type,
                     Int96Converter,
-                >::new(page_iterator, column_desc)?))
+                >::new(
+                    page_iterator, column_desc, converter
+                )?))
             }
             PhysicalType::FLOAT => Ok(Box::new(PrimitiveArrayReader::<FloatType>::new(
                 page_iterator,
@@ -818,25 +844,44 @@ impl<'a> ArrayReaderBuilder {
             )),
             PhysicalType::BYTE_ARRAY => {
                 if cur_type.get_basic_info().logical_type() == LogicalType::UTF8 {
+                    let converter = Utf8Converter::new(Utf8ArrayConverter {});
                     Ok(Box::new(ComplexObjectArrayReader::<
                         ByteArrayType,
                         Utf8Converter,
                     >::new(
-                        page_iterator, column_desc
+                        page_iterator, column_desc, converter
                     )?))
                 } else {
+                    let converter = BinaryConverter::new(BinaryArrayConverter {});
                     Ok(Box::new(ComplexObjectArrayReader::<
                         ByteArrayType,
                         BinaryConverter,
                     >::new(
-                        page_iterator, column_desc
+                        page_iterator, column_desc, converter
                     )?))
                 }
             }
-            other => Err(ArrowError(format!(
-                "Unable to create primitive array reader for parquet physical type {}",
-                other
-            ))),
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let byte_width = match *cur_type {
+                    Type::PrimitiveType {
+                        ref type_length, ..
+                    } => *type_length,
+                    _ => {
+                        return Err(ArrowError(format!(
+                            "Expected a physical type, not a group type"
+                        )))
+                    }
+                };
+                let converter = FixedLenBinaryConverter::new(
+                    FixedSizeArrayConverter::new(byte_width),
+                );
+                Ok(Box::new(ComplexObjectArrayReader::<
+                    FixedLenByteArrayType,
+                    FixedLenBinaryConverter,
+                >::new(
+                    page_iterator, column_desc, converter
+                )?))
+            }
         }
     }
 
@@ -891,8 +936,10 @@ mod tests {
     use crate::util::test_common::{get_test_file, make_pages};
     use arrow::array::{Array, ArrayRef, PrimitiveArray, StringArray, StructArray};
     use arrow::datatypes::{
-        DataType as ArrowType, Field, Int32Type as ArrowInt32, UInt32Type as ArrowUInt32,
-        UInt64Type as ArrowUInt64,
+        DataType as ArrowType, Field, Int32Type as ArrowInt32,
+        TimestampMicrosecondType as ArrowTimestampMicrosecondType,
+        TimestampMillisecondType as ArrowTimestampMillisecondType,
+        UInt32Type as ArrowUInt32, UInt64Type as ArrowUInt64,
     };
     use rand::distributions::uniform::SampleUniform;
     use rand::{thread_rng, Rng};
@@ -1123,15 +1170,15 @@ mod tests {
             Int64Type,
             PhysicalType::INT64,
             "TIMESTAMP_MILLIS",
-            ArrowUInt64,
-            u64
+            ArrowTimestampMillisecondType,
+            i64
         );
         test_primitive_array_reader_one_type!(
             Int64Type,
             PhysicalType::INT64,
             "TIMESTAMP_MICROS",
-            ArrowUInt64,
-            u64
+            ArrowTimestampMicrosecondType,
+            i64
         );
     }
 
@@ -1288,10 +1335,12 @@ mod tests {
         let page_iterator =
             InMemoryPageIterator::new(schema.clone(), column_desc.clone(), pages);
 
+        let converter = Utf8Converter::new(Utf8ArrayConverter {});
         let mut array_reader =
             ComplexObjectArrayReader::<ByteArrayType, Utf8Converter>::new(
                 Box::new(page_iterator),
                 column_desc.clone(),
+                converter,
             )
             .unwrap();
 

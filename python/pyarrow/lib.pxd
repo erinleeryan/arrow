@@ -28,7 +28,6 @@ cdef extern from "Python.h":
     int PySlice_Check(object)
 
 
-cdef CFunctionContext* _context() nogil
 cdef int check_status(const CStatus& status) nogil except -1
 
 cdef class Message:
@@ -154,6 +153,7 @@ cdef class KeyValueMetadata(_Metadata):
         const CKeyValueMetadata* metadata
 
     cdef void init(self, const shared_ptr[const CKeyValueMetadata]& wrapped)
+
     @staticmethod
     cdef wrap(const shared_ptr[const CKeyValueMetadata]& sp)
     cdef inline shared_ptr[const CKeyValueMetadata] unwrap(self) nogil
